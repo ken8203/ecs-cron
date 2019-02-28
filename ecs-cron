@@ -1,0 +1,164 @@
+#! /usr/bin/env bash
+
+VERSION="0.1.0"
+COMPOSE_FILE="./docker-compose.yml"
+ECS_PARAMS="./ecs-params.yml"
+AWS_PROFILE=""
+AWS_CLI_PROFILE=""
+ECS_CLI_PROFILE=""
+
+function usage() {
+    cat << EOM
+##### ecs-cron #####
+Simple script to leverage ecs scheduled task.
+
+Required arguments:
+    -c | --cluster               AWS ECS cluster name
+    -t | --task-name             AWS ECS task definition name
+    -e | --events-rule-name      AWS CloudWatch events rule name
+
+Optional arguments:
+    -r | --region                AWS region. Default is ap-northeast-1.
+    -p | --profile               AWS profile. Default is default.
+    -C | --compose-file          Path of docker-compose.yml. Default is ./docker-compose.yml
+    -E | --ecs-params            Path of ecs-params.yml. Default is ./ecs-params.yml
+
+Examples:
+    Create a cron:
+      ecs-cron up -c cluster_name -t task_name -e events_rule_name [ -r region ] [ -p profile ] [ -C docker-compose.yml ] [ -E ecs-params.yml ]
+
+    Delete a cron:
+      ecs-cron down -c cluster_name -t task_name -e events_rule_name [ -r region ] [ -p profile ]
+
+Notes:
+    Need docker-compose.yml and ecs-params.yml.
+EOM
+    exit 3
+}
+
+function require() {
+    command -v "$1" > /dev/null 2>&1 || {
+        echo "Some of the required software is not installed:"
+        echo "    please install $1" >&2;
+        exit 4;
+    }
+}
+
+function assertRequiredVariablesSet() {
+    if [ "$AWS_PROFILE" != "" ]; then
+        AWS_CLI_PROFILE="--profile $AWS_PROFILE"
+        ECS_CLI_PROFILE="--aws-profile $AWS_PROFILE"
+    fi
+
+    if [ -z ${REGION+x} ]; then
+        REGION="ap-northeast-1"
+    fi
+}
+
+function getAccountId() {
+    ACCOUNT_ID=`aws sts get-caller-identity $AWS_CLI_PROFILE --query 'Account' --output text`
+}
+
+function getCurrentTaskDefinition() {
+    TASK_DEFINITION_ARN=`aws ecs list-task-definitions $AWS_CLI_PROFILE --family-prefix $TASK_NAME --sort DESC --query taskDefinitionArns[0] --output text`
+}
+
+function activateTaskDefinition() {
+    ecs-cli compose $ECS_CLI_PROFILE --project-name $TASK_NAME \
+        --file "$COMPOSE_FILE" \
+        --ecs-params "$ECS_PARAMS" \
+        create --cluster $CLUSTER --region $REGION
+}
+
+function addScheduledJob() {
+    getCurrentTaskDefinition
+    aws events put-targets $AWS_CLI_PROFILE \
+        --rule $EVENTS_RULE_NAME \
+        --targets "Id"=$TASK_NAME,"Arn"=$ARN,"RoleArn"=$ROLEARN,"EcsParameters"="{"TaskDefinitionArn"=$TASK_DEFINITION_ARN,"TaskCount"=1}"
+}
+
+function deactivateTaskDefinition() {
+    getCurrentTaskDefinition
+    aws ecs deregister-task-definition $AWS_CLI_PROFILE \
+        --task-definition $TASK_DEFINITION_ARN
+}
+
+function removeScheduledJob() {
+    aws events remove-targets $AWS_CLI_PROFILE \
+        --rule $EVENTS_RULE_NAME \
+        --ids $TASK_NAME
+}
+
+if [ "$BASH_SOURCE" == "$0" ]; then
+    set -u
+
+    if [ $# -lt 2 ]; then usage; fi
+
+    COMMAND="$1"
+    shift
+
+    # Check for awscli and ecs-cli
+    require aws
+    require ecs-cli
+
+    while [[ $# -gt 0 ]]
+    do
+        key="$1"
+
+        case $key in
+            -r|--region)
+                REGION="$2"
+                shift
+                ;;
+            -p|--profile)
+                AWS_PROFILE="$2"
+                shift
+                ;;
+            -c|--cluster)
+                CLUSTER="$2"
+                shift
+                ;;
+            -t|--task-name)
+                TASK_NAME="$2"
+                shift
+                ;;
+            -e|--events-rule-name)
+                EVENTS_RULE_NAME="$2"
+                shift
+                ;;
+            -C|--compose-file)
+                COMPOSE_FILE="$2"
+                shift
+                ;;
+            -E|--ecs-params)
+                ECS_PARAMS="$2"
+                shift
+                ;;
+            *)
+                usage
+                exit 2
+            ;;
+        esac
+        shift
+    done
+
+    assertRequiredVariablesSet
+    getAccountId
+    ARN="arn:aws:ecs:$REGION:$ACCOUNT_ID:cluster/$CLUSTER"
+    ROLEARN="arn:aws:iam::$ACCOUNT_ID:role/ecsEventsRole"
+
+    case $COMMAND in
+        up)
+            activateTaskDefinition
+            addScheduledJob
+            ;;
+        down)
+            deactivateTaskDefinition
+            removeScheduledJob
+            ;;
+        *)
+            usage
+            exit 2
+        ;;
+    esac
+fi
