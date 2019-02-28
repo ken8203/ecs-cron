@@ -1,0 +1,6 @@
+version: 1
+task_definition:
+  services:
+    cron:
+      cpu_shares: 128
+      mem_reservation: 128000000
